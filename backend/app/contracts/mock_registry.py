@@ -6,7 +6,10 @@ Provides mock implementations so usm and muw can develop without live LLM agents
 from typing import Optional, Dict, Any, List
 import asyncio
 import random
+import logging
 from datetime import datetime
+
+logger = logging.getLogger(__name__)
 
 from app.contracts.base_agent import BaseAgent
 from app.contracts.base_judge import BaseJudge
@@ -26,7 +29,7 @@ class MockBobAgent(BaseAgent):
 
     def __init__(self):
         super().__init__(
-            agent_id="mock-bob-tutor",
+            agent_id="bob-tutor",
             agent_type=AgentType.BOB_TUTOR,
             config={"mock": True, "response_delay_ms": 100}
         )
@@ -96,7 +99,7 @@ class MockAliceAgent(BaseAgent):
 
     def __init__(self):
         super().__init__(
-            agent_id="mock-alice-arithmetic",
+            agent_id="alice-arithmetic",
             agent_type=AgentType.ALICE_ARITHMETIC,
             config={"mock": True, "error_rate": 0.3}
         )
@@ -168,7 +171,7 @@ class MockCharlieAgent(BaseAgent):
 
     def __init__(self):
         super().__init__(
-            agent_id="mock-charlie-conceptual",
+            agent_id="charlie-conceptual",
             agent_type=AgentType.CHARLIE_CONCEPTUAL,
             config={"mock": True, "misconception_rate": 0.4}
         )
