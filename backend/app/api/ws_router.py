@@ -8,12 +8,26 @@ from typing import Dict, Set
 import json
 import asyncio
 import logging
+from datetime import datetime
 
 from app.config import settings
+from app.state.pydantic_state import PeerRingState, DialogueMessage, MessageRole
+from app.contracts.mock_registry import mock_registry
+from app.telemetry.prism_client import prism_client
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+
+# In-memory session state storage for development
+session_states: Dict[str, PeerRingState] = {}
+
+
+def get_or_create_session_state(session_id: str) -> PeerRingState:
+    """Get existing PeerRingState or create a new session state."""
+    if session_id not in session_states:
+        session_states[session_id] = PeerRingState(session_id=session_id)
+    return session_states[session_id]
 
 
 class ConnectionManager:
@@ -59,18 +73,44 @@ manager = ConnectionManager()
 async def websocket_endpoint(websocket: WebSocket, session_id: str):
     """
     Main WebSocket endpoint for real-time communication.
-    Handles turn-based message flow with Redis locking.
+    Handles turn-based message flow with MockAgentRegistry integration.
     """
     await manager.connect(websocket, session_id)
+    state = get_or_create_session_state(session_id)
+
+    # Send initial state sync upon connection
+    await manager.send_personal_message(
+        {
+            "type": "STATE_SYNC",
+            "session_id": session_id,
+            "turn_count": state.turn_count,
+            "policy": {
+                "assistance_level": state.policy.assistance_level.current_level,
+                "assistance_level_name": state.policy.assistance_level.level_names[state.policy.assistance_level.current_level - 1],
+                "struggle_score": state.policy.struggle_score,
+                "recovery_state": state.policy.recovery_state.value,
+            },
+            "messages_count": len(state.messages),
+            "timestamp": datetime.utcnow().isoformat()
+        },
+        session_id
+    )
 
     try:
         while True:
             # Wait for incoming message
             data = await websocket.receive_text()
-            message = json.loads(data)
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                await manager.send_personal_message(
+                    {"type": "error", "message": "Malformed JSON payload"},
+                    session_id
+                )
+                continue
 
             # Basic message validation
-            if "type" not in message:
+            if not isinstance(message, dict) or "type" not in message:
                 await manager.send_personal_message(
                     {"type": "error", "message": "Invalid message format"},
                     session_id
@@ -86,7 +126,7 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
                     session_id
                 )
             else:
-                logger.warning(f"Unknown message type: {message['type']}")
+                logger.warning(f"Unknown message type: {message.get('type')}")
 
     except WebSocketDisconnect:
         manager.disconnect(session_id)
@@ -97,26 +137,82 @@ async def websocket_endpoint(websocket: WebSocket, session_id: str):
 
 async def handle_user_message(session_id: str, message: dict):
     """
-    Handle incoming user messages.
-    This is where we'll integrate with the agent pipeline later.
+    Handle incoming user messages through MockAgentRegistry, PRISM telemetry ambient sessions, and state updates.
     """
-    # TODO: Implement turn locking with Redis
-    # TODO: Load PeerRingState from Redis
-    # TODO: Route through agent pipeline
-    # TODO: Apply governance checks
-    # TODO: Stream response back to client
+    content = message.get("content", "").strip()
+    if not content:
+        await manager.send_personal_message(
+            {"type": "error", "message": "Message content cannot be empty"},
+            session_id
+        )
+        return
 
-    # For now, send a simple echo response
-    response = {
-        "type": "AGENT_RESPONSE",
-        "session_id": session_id,
-        "agent_id": "mock-agent",
-        "content": f"Echo: {message.get('content', '')}",
-        "timestamp": message.get("timestamp"),
-        "metadata": {
-            "foundation_layer": "active",
-            "mock_response": True
+    state = get_or_create_session_state(session_id)
+
+    # Wrap turn execution in ambient PRISM session context (Step 5)
+    with prism_client.ambient_session(session_id):
+        # Execute mock turn
+        result = await mock_registry.run_mock_turn(state, content)
+
+        if "error" in result:
+            await manager.send_personal_message(
+                {"type": "error", "message": result["error"]},
+                session_id
+            )
+            return
+
+        response = result["response"]
+        governance = result["governance"]
+        winner_id = result["winner"]
+
+        # Record manual PRISM traces for agent turn (Step 7 - stable IDs: bob-tutor, alice-peer, charlie-peer)
+        prism_client.trace_agent_turn_async(
+            session_id=session_id,
+            agent_id=response.agent_id,
+            user_input=content,
+            response_text=response.content,
+            latency_ms=response.generation_time_ms or 150,
+            metadata={
+                "has_blackboard_patch": response.blackboard_patch is not None,
+                "confidence": response.confidence,
+                "struggle_score": state.policy.struggle_score,
+                "assistance_level": state.policy.assistance_level.current_level,
+            }
+        )
+
+        # Record manual PRISM traces for governance judges (Step 7 - stable IDs: leak-judge, help-judge)
+        for jtype, verdict in governance.items():
+            prism_client.trace_judge_eval_async(
+                session_id=session_id,
+                judge_type=jtype,
+                evaluated_text=response.content,
+                verdict=verdict,
+                latency_ms=verdict.evaluation_time_ms or 50
+            )
+
+        governance_flags = {
+            jtype: verdict.verdict for jtype, verdict in governance.items()
         }
-    }
 
-    await manager.send_personal_message(response, session_id)
+        # Format agent response event for client
+        agent_response_event = {
+            "type": "AGENT_RESPONSE",
+            "session_id": session_id,
+            "agent_id": response.agent_id,
+            "active_speaker": winner_id,
+            "content": response.content,
+            "think_block": response.think_block,
+            "blackboard_patch": response.blackboard_patch,
+            "governance_flags": governance_flags,
+            "policy_state": {
+                "assistance_level": state.policy.assistance_level.current_level,
+                "assistance_level_name": state.policy.assistance_level.level_names[state.policy.assistance_level.current_level - 1],
+                "struggle_score": state.policy.struggle_score,
+                "recovery_state": state.policy.recovery_state.value
+            },
+            "turn_count": state.turn_count,
+            "timestamp": datetime.utcnow().isoformat(),
+            "metadata": response.metadata
+        }
+
+        await manager.send_personal_message(agent_response_event, session_id)
